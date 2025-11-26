@@ -1,6 +1,5 @@
 fastapi
 uvicorn[standard]
 selenium
-webdriver-manager
 supabase
 python-dotenv
