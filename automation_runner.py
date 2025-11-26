@@ -3,9 +3,7 @@ from datetime import datetime
 from supabase import create_client, Client
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import WebDriverException
-from webdriver_manager.chrome import ChromeDriverManager
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
@@ -45,12 +43,11 @@ def run_job(job_id: str) -> None:
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-
+    
     driver = None
     try:
-        # Single, preconfigured driver for this job
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
+        # Let Selenium Manager resolve the correct ChromeDriver for the installed Chromium
+        driver = webdriver.Chrome(options=options)
 
         # Allow generated script to call webdriver.Chrome() but always reuse this driver
         def _reuse_existing_driver(*_args, **_kwargs):
