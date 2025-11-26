@@ -94,9 +94,11 @@ def run_job(job_id: str) -> None:
         exec_globals = {
             "driver": driver,
             "log": log,
+            "_log": log,  # backwards-compatible alias
             "capture_screenshot": capture_screenshot,
             "webdriver": webdriver,
             "WebDriverException": WebDriverException,
+            "sys": sys,
             "__name__": "__main__",
         }
         exec(script, exec_globals, {})
