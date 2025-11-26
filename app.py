@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Header
 from pydantic import BaseModel
 from automation_runner import run_job
 
@@ -19,10 +19,15 @@ async def health():
 
 
 @app.post("/jobs/start")
-async def start_job(payload: JobRequest, background: BackgroundTasks, authorization: str | None = None):
+async def start_job(
+    payload: JobRequest,
+    background: BackgroundTasks,
+    authorization: str | None = Header(default=None),  # reads Authorization header
+):
     # Simple shared-secret auth
     if WORKER_AUTH_TOKEN:
-        if not authorization or authorization != f"Bearer {WORKER_AUTH_TOKEN}":
+        expected = f"Bearer {WORKER_AUTH_TOKEN}"
+        if not authorization or authorization != expected:
             raise HTTPException(status_code=401, detail="Unauthorized")
 
     background.add_task(run_job, payload.jobId)
