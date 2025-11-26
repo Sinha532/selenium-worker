@@ -17,12 +17,22 @@ def update_job(job_id: str, **fields):
     supabase.table("automation_jobs").update(fields).eq("id", job_id).execute()
 
 
-def upload_screenshot(job_id: str, path: str) -> str:
+def upload_screenshot(job_id: str, path: str, update_latest: bool = True) -> str:
+    """
+    Upload a screenshot to Supabase Storage.
+
+    If update_latest is True, also update automation_jobs.latest_screenshot_url.
+    This lets us avoid overwriting the last meaningful screenshot with
+    maintenance shots like 'before-quit' or 'final'.
+    """
     storage_path = f"{job_id}/{os.path.basename(path)}"
     with open(path, "rb") as f:
         supabase.storage.from_(BUCKET_NAME).upload(storage_path, f, {"upsert": "true"})
     public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(storage_path)
-    update_job(job_id, latest_screenshot_url=public_url)
+
+    if update_latest:
+        update_job(job_id, latest_screenshot_url=public_url)
+
     return public_url
 
 
@@ -44,7 +54,7 @@ def run_job(job_id: str) -> None:
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    
+
     driver = None
     try:
         # Let Selenium Manager resolve the correct ChromeDriver for the installed Chromium
@@ -60,8 +70,10 @@ def run_job(job_id: str) -> None:
         def log(msg: str):
             print(msg, flush=True)
 
-        # Helper so script can push screenshots mid-run
-        def capture_screenshot(label: str | None = None) -> str:
+        # Helper so script can push screenshots mid-run.
+        # By default, these DO update latest_screenshot_url so the UI shows
+        # the last meaningful frame from the automation.
+        def capture_screenshot(label: str | None = None, update_latest: bool = True) -> str:
             safe_label = label.replace(" ", "-") if label else "step"
             filename = f"{job_id}-{safe_label}-{datetime.utcnow().isoformat()}.png"
             try:
@@ -70,17 +82,18 @@ def run_job(job_id: str) -> None:
                 log(f"Failed to capture screenshot '{safe_label}': {e}")
                 return ""
             try:
-                return upload_screenshot(job_id, filename)
+                return upload_screenshot(job_id, filename, update_latest=update_latest)
             except Exception as e:
                 log(f"Failed to upload screenshot '{safe_label}': {e}")
                 return ""
 
-        # Wrap driver.quit so script-level quit still works
+        # Wrap driver.quit so scripts that call it still produce a debug screenshot
+        # but do NOT overwrite latest_screenshot_url.
         original_quit = driver.quit
 
         def _wrapped_quit(*_args, **_kwargs):
             try:
-                capture_screenshot("before-quit")
+                capture_screenshot("before-quit", update_latest=False)
             except Exception as e:
                 print(f"Error capturing screenshot before quit: {e}", flush=True)
             try:
@@ -104,8 +117,9 @@ def run_job(job_id: str) -> None:
         }
         exec(script, exec_globals, {})
 
-        # Final best-effort screenshot
-        capture_screenshot("final")
+        # Final best-effort screenshot for debugging, but do NOT overwrite
+        # latest_screenshot_url that came from the script itself.
+        capture_screenshot("final", update_latest=False)
 
         update_job(job_id, status="completed", error_message=None)
     except Exception as e:
