@@ -50,6 +50,14 @@ def run_job(job_id: str) -> None:
     # 2) Mark job as running
     update_job(job_id, status="running")
 
+    # In-memory log buffer so we can persist logs to automation_jobs.log_output
+    log_lines: list[str] = []
+
+    def log(msg: str):
+        text = str(msg)
+        print(text, flush=True)
+        log_lines.append(text)
+
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -65,10 +73,6 @@ def run_job(job_id: str) -> None:
             return driver
 
         webdriver.Chrome = _reuse_existing_driver  # type: ignore[assignment]
-
-        # Helper for structured logging
-        def log(msg: str):
-            print(msg, flush=True)
 
         # Helper so script can push screenshots mid-run.
         # By default, these DO update latest_screenshot_url so the UI shows
@@ -108,7 +112,8 @@ def run_job(job_id: str) -> None:
         exec_globals = {
             "driver": driver,
             "log": log,
-            "_log": log,  # backwards-compatible alias
+            "_log": log,          # backwards-compatible alias
+            "log_step": log,      # NEW: so generated scripts can safely call log_step(...)
             "capture_screenshot": capture_screenshot,
             "webdriver": webdriver,
             "WebDriverException": WebDriverException,
@@ -121,9 +126,16 @@ def run_job(job_id: str) -> None:
         # latest_screenshot_url that came from the script itself.
         capture_screenshot("final", update_latest=False)
 
-        update_job(job_id, status="completed", error_message=None)
+        fields = {"status": "completed", "error_message": None}
+        if log_lines:
+            fields["log_output"] = "\n".join(log_lines)
+        update_job(job_id, **fields)
     except Exception as e:
-        update_job(job_id, status="failed", error_message=str(e))
+        log(f"Unhandled exception in run_job for job {job_id}: {e}")
+        fields = {"status": "failed", "error_message": str(e)}
+        if log_lines:
+            fields["log_output"] = "\n".join(log_lines)
+        update_job(job_id, **fields)
         raise
     finally:
         if driver:
