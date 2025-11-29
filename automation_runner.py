@@ -7,7 +7,11 @@ from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import WebDriverException
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+# Prefer the service role key env, but also allow SUPABASE_SERVICE_KEY
+SUPABASE_KEY = (
+    os.environ.get("SUPABASE_SERVICE_KEY")
+    or os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+)
 BUCKET_NAME = os.getenv("SUPABASE_SCREENSHOT_BUCKET", "automation-screenshots")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -37,20 +41,8 @@ def upload_screenshot(job_id: str, path: str, update_latest: bool = True) -> str
 
 
 def run_job(job_id: str) -> None:
-    # 1) Fetch script from Supabase
-    res = (
-        supabase.table("automation_jobs")
-        .select("script")
-        .eq("id", job_id)
-        .single()
-        .execute()
-    )
-    script = res.data["script"]
-
-    # 2) Mark job as running
+    # In‑DB status + log buffer
     update_job(job_id, status="running")
-
-    # In-memory log buffer so we can persist logs to automation_jobs.log_output
     log_lines: list[str] = []
 
     def log(msg: str):
@@ -58,88 +50,110 @@ def run_job(job_id: str) -> None:
         print(text, flush=True)
         log_lines.append(text)
 
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-
-    driver = None
     try:
-        # Let Selenium Manager resolve the correct ChromeDriver for the installed Chromium
-        driver = webdriver.Chrome(options=options)
+        # 1) Fetch script from Supabase
+        res = (
+            supabase.table("automation_jobs")
+            .select("script")
+            .eq("id", job_id)
+            .single()
+            .execute()
+        )
+        script = res.data["script"]
 
-        # Allow generated script to call webdriver.Chrome() but always reuse this driver
-        def _reuse_existing_driver(*_args, **_kwargs):
-            return driver
+        log(f"Starting automation job {job_id}...")
 
-        webdriver.Chrome = _reuse_existing_driver  # type: ignore[assignment]
+        options = Options()
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
 
-        # Helper so script can push screenshots mid-run.
-        # By default, these DO update latest_screenshot_url so the UI shows
-        # the last meaningful frame from the automation.
-        def capture_screenshot(label: str | None = None, update_latest: bool = True) -> str:
-            safe_label = label.replace(" ", "-") if label else "step"
-            filename = f"{job_id}-{safe_label}-{datetime.utcnow().isoformat()}.png"
+        driver = None
+        try:
+            # Let Selenium Manager resolve the correct ChromeDriver
+            driver = webdriver.Chrome(options=options)
+
+            # Allow generated script to call webdriver.Chrome() but always reuse this driver
+            def _reuse_existing_driver(*_args, **_kwargs):
+                return driver
+
+            webdriver.Chrome = _reuse_existing_driver  # type: ignore[assignment]
+
+            # Screenshot helper exposed to the script
+            def capture_screenshot(label: str | None = None, update_latest: bool = True) -> str:
+                safe_label = label.replace(" ", "-") if label else "step"
+                filename = f"{job_id}-{safe_label}-{datetime.utcnow().isoformat()}.png"
+                try:
+                    driver.save_screenshot(filename)
+                except Exception as e:
+                    log(f"Failed to capture screenshot '{safe_label}': {e}")
+                    return ""
+                try:
+                    return upload_screenshot(job_id, filename, update_latest=update_latest)
+                except Exception as e:
+                    log(f"Failed to upload screenshot '{safe_label}': {e}")
+                    return ""
+
+            # Wrap driver.quit so scripts that call it still produce a debug screenshot
+            # but do NOT overwrite latest_screenshot_url.
+            original_quit = driver.quit
+
+            def _wrapped_quit(*_args, **_kwargs):
+                try:
+                    capture_screenshot("before-quit", update_latest=False)
+                except Exception as e:
+                    print(f"Error capturing screenshot before quit: {e}", flush=True)
+                try:
+                    return original_quit(*_args, **_kwargs)
+                except Exception as e:
+                    print(f"Error while quitting driver: {e}", flush=True)
+                    return None
+
+            driver.quit = _wrapped_quit  # type: ignore[assignment]
+
+            # Execute generated script as if run as __main__
+            exec_globals = {
+                "driver": driver,
+                "log": log,
+                "_log": log,
+                "log_step": log,          # <— IMPORTANT: what your script is calling
+                "capture_screenshot": capture_screenshot,
+                "webdriver": webdriver,
+                "WebDriverException": WebDriverException,
+                "sys": sys,
+                "__name__": "__main__",
+            }
+
+            log("Executing generated script...")
+            exec(script, exec_globals, {})
+            log("Script execution finished.")
+
+            # Final best-effort screenshot for debugging, but do NOT overwrite
+            # latest_screenshot_url that came from the script itself.
             try:
-                driver.save_screenshot(filename)
+                capture_screenshot("final", update_latest=False)
             except Exception as e:
-                log(f"Failed to capture screenshot '{safe_label}': {e}")
-                return ""
-            try:
-                return upload_screenshot(job_id, filename, update_latest=update_latest)
-            except Exception as e:
-                log(f"Failed to upload screenshot '{safe_label}': {e}")
-                return ""
+                log(f"Failed to capture final screenshot: {e}")
 
-        # Wrap driver.quit so scripts that call it still produce a debug screenshot
-        # but do NOT overwrite latest_screenshot_url.
-        original_quit = driver.quit
-
-        def _wrapped_quit(*_args, **_kwargs):
-            try:
-                capture_screenshot("before-quit", update_latest=False)
-            except Exception as e:
-                print(f"Error capturing screenshot before quit: {e}", flush=True)
-            try:
-                return original_quit(*_args, **_kwargs)
-            except Exception as e:
-                print(f"Error while quitting driver: {e}", flush=True)
-                return None
-
-        driver.quit = _wrapped_quit  # type: ignore[assignment]
-
-        # Execute generated script as if run as __main__
-        exec_globals = {
-            "driver": driver,
-            "log": log,
-            "_log": log,          # backwards-compatible alias
-            "log_step": log,      # NEW: so generated scripts can safely call log_step(...)
-            "capture_screenshot": capture_screenshot,
-            "webdriver": webdriver,
-            "WebDriverException": WebDriverException,
-            "sys": sys,
-            "__name__": "__main__",
-        }
-        exec(script, exec_globals, {})
-
-        # Final best-effort screenshot for debugging, but do NOT overwrite
-        # latest_screenshot_url that came from the script itself.
-        capture_screenshot("final", update_latest=False)
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
 
         fields = {"status": "completed", "error_message": None}
         if log_lines:
             fields["log_output"] = "\n".join(log_lines)
         update_job(job_id, **fields)
+        log(f"Job {job_id} completed.")
     except Exception as e:
-        log(f"Unhandled exception in run_job for job {job_id}: {e}")
+        # Any unhandled error should be recorded on the job
+        err_msg = f"Unhandled exception in run_job for job {job_id}: {e}"
+        print(err_msg, flush=True)
+        log_lines.append(err_msg)
         fields = {"status": "failed", "error_message": str(e)}
         if log_lines:
             fields["log_output"] = "\n".join(log_lines)
         update_job(job_id, **fields)
         raise
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
