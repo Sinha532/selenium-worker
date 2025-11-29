@@ -125,7 +125,7 @@ def run_job(job_id: str) -> None:
             }
 
             log("Executing generated script...")
-            exec(script, exec_globals, {})
+            exec(script, exec_globals)
             log("Script execution finished.")
 
             # Final best-effort screenshot for debugging, but do NOT overwrite
